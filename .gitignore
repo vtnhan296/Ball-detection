@@ -1,0 +1,45 @@
+# Python / notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Large datasets and generated media
+data/raw/
+data/yolo/**/images/
+data/yolo/**/labels/
+outputs/
+
+# Model weights and exports
+models/pretrained/*.pt
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+
+# Images and videos
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Keep lightweight dataset configs tracked
+!data/yolo/**/data.yaml
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
