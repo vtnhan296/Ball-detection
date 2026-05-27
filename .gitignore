@@ -13,11 +13,15 @@ data/raw/
 data/yolo/**/images/
 data/yolo/**/labels/
 outputs/
+experiments/tracking_hota/runs/*
+!experiments/tracking_hota/runs/.gitkeep
 
 # Model weights and exports
+models/reid/
 models/pretrained/*.pt
 *.pt
 *.pth
+*.pth.tar
 *.onnx
 *.engine
 *.torchscript
