@@ -1,7 +1,0 @@
-path: C:\Users\CPU13374\Downloads\SoccerNet\data\yolo\patches
-train: images/train
-val: images/val
-names:
-  0: player
-  1: goalkeeper
-  2: referee
