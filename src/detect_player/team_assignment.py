@@ -178,6 +178,210 @@ def assign_teams(results: list[DetectionResult]) -> None:
     )
 
 
+def assign_teams_temporal_prototypes(
+    results: list[DetectionResult],
+    metadata: list[dict[str, Any]],
+    calibration_frames: int = 50,
+    use_track_pooling: bool = True,
+) -> None:
+    """Assign teams using early-frame position only to orient ReID prototypes.
+
+    The first `calibration_frames` selected frames define which embedding cluster
+    is visually left/right. All detections are then assigned by cosine distance
+    to the fixed prototypes, so later field position changes do not flip teams.
+    """
+
+    if len(results) != len(metadata):
+        log.warning(
+            "Temporal team assignment needs aligned results/metadata; "
+            "falling back to global team assignment."
+        )
+        assign_teams(results)
+        return
+
+    frame_numbers = [
+        int(meta.get("frame_number", meta.get("image_idx", 0)))
+        for meta in metadata
+    ]
+    if not frame_numbers:
+        return
+
+    first_frame = min(frame_numbers)
+    calibration_end = first_frame + max(1, int(calibration_frames)) - 1
+    player_indices = [
+        idx
+        for idx, result in enumerate(results)
+        if result.role == "player" and result.embedding is not None
+    ]
+    calibration_player_indices = [
+        idx
+        for idx in player_indices
+        if frame_numbers[idx] <= calibration_end
+    ]
+
+    if len(calibration_player_indices) < 2:
+        log.warning(
+            "Temporal team calibration has fewer than 2 player embeddings; "
+            "falling back to global team assignment."
+        )
+        assign_teams(results)
+        return
+
+    require_dependency("sklearn", "pip install scikit-learn")
+    from sklearn.cluster import KMeans
+
+    calibration_embs = stack_normalized_embeddings(
+        [results[idx].embedding for idx in calibration_player_indices]
+    )
+    try:
+        kmeans = KMeans(n_clusters=2, random_state=0, n_init=10).fit(calibration_embs)
+        calibration_labels = kmeans.labels_
+    except Exception as exc:
+        log.warning(
+            "Temporal team calibration KMeans failed (%s); "
+            "falling back to global team assignment.",
+            exc,
+        )
+        assign_teams(results)
+        return
+
+    label_counts = {
+        label: int(np.sum(calibration_labels == label)) for label in (0, 1)
+    }
+    if label_counts[0] == 0 or label_counts[1] == 0:
+        log.warning(
+            "Temporal team calibration produced an empty cluster; "
+            "falling back to global team assignment."
+        )
+        assign_teams(results)
+        return
+
+    cluster_x = {0: [], 1: []}
+    for label, result_idx in zip(calibration_labels, calibration_player_indices):
+        cluster_x[int(label)].append(bbox_center_x(results[result_idx].bbox_xyxy))
+
+    avg_x = {
+        label: float(np.mean(values)) if values else float("inf")
+        for label, values in cluster_x.items()
+    }
+    left_label = 0 if avg_x[0] <= avg_x[1] else 1
+    right_label = 1 - left_label
+    label_to_team = {left_label: 0, right_label: 1}
+    label_to_side = {left_label: "left", right_label: "right"}
+
+    team_member_embeddings: dict[int, list[np.ndarray]] = {0: [], 1: []}
+    for label, result_idx in zip(calibration_labels, calibration_player_indices):
+        team_id = label_to_team[int(label)]
+        team_member_embeddings[team_id].append(
+            normalize_embedding(results[result_idx].embedding)
+        )
+
+    prototypes = {
+        team_id: normalize_embedding(np.mean(embeddings, axis=0))
+        for team_id, embeddings in team_member_embeddings.items()
+        if embeddings
+    }
+    if 0 not in prototypes or 1 not in prototypes:
+        log.warning(
+            "Temporal team calibration could not build both prototypes; "
+            "falling back to global team assignment."
+        )
+        assign_teams(results)
+        return
+
+    if use_track_pooling:
+        assign_players_by_track_prototypes(results, metadata, player_indices, prototypes)
+    else:
+        for idx in player_indices:
+            assign_result_by_prototypes(results[idx], prototypes)
+
+    goalkeeper_indices = [
+        idx
+        for idx, result in enumerate(results)
+        if result.role == "goalkeeper" and result.embedding is not None
+    ]
+    for idx in goalkeeper_indices:
+        assign_result_by_prototypes(results[idx], prototypes)
+
+
+def stack_normalized_embeddings(embeddings: list[np.ndarray]) -> np.ndarray:
+    stacked = np.stack([normalize_embedding(embedding) for embedding in embeddings])
+    if stacked.ndim > 2:
+        stacked = stacked.reshape(len(embeddings), -1)
+    return stacked
+
+
+def normalize_embedding(embedding: Any) -> np.ndarray:
+    vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else vector
+
+
+def cosine_distances_to_prototypes(
+    embedding: Any,
+    prototypes: dict[int, np.ndarray],
+) -> dict[int, float]:
+    vector = normalize_embedding(embedding)
+    return {
+        team_id: float(1.0 - np.dot(vector, prototype))
+        for team_id, prototype in prototypes.items()
+    }
+
+
+def assign_result_by_prototypes(
+    result: DetectionResult,
+    prototypes: dict[int, np.ndarray],
+    source: str = "prototype",
+) -> None:
+    distances = cosine_distances_to_prototypes(result.embedding, prototypes)
+    if not distances:
+        return
+    team_id = min(distances, key=distances.get)
+    result.team_id = int(team_id)
+    result.side_label = "left" if int(team_id) == 0 else "right"
+    result.team_assignment_source = source
+    result.distance_to_left = distances.get(0)
+    result.distance_to_right = distances.get(1)
+
+
+def assign_players_by_track_prototypes(
+    results: list[DetectionResult],
+    metadata: list[dict[str, Any]],
+    player_indices: list[int],
+    prototypes: dict[int, np.ndarray],
+) -> None:
+    track_embeddings: dict[int, list[np.ndarray]] = {}
+    no_track_indices: list[int] = []
+
+    for idx in player_indices:
+        track_id = metadata[idx].get("track_id")
+        if track_id is None:
+            no_track_indices.append(idx)
+            continue
+        track_embeddings.setdefault(int(track_id), []).append(
+            normalize_embedding(results[idx].embedding)
+        )
+
+    track_team: dict[int, int] = {}
+    for track_id, embeddings in track_embeddings.items():
+        pooled = normalize_embedding(np.mean(embeddings, axis=0))
+        distances = cosine_distances_to_prototypes(pooled, prototypes)
+        track_team[track_id] = min(distances, key=distances.get)
+
+    for idx in player_indices:
+        track_id = metadata[idx].get("track_id")
+        if track_id is None:
+            assign_result_by_prototypes(results[idx], prototypes, source="prototype")
+            continue
+        team_id = int(track_team[int(track_id)])
+        distances = cosine_distances_to_prototypes(results[idx].embedding, prototypes)
+        results[idx].team_id = team_id
+        results[idx].side_label = "left" if team_id == 0 else "right"
+        results[idx].team_assignment_source = "track_prototype"
+        results[idx].distance_to_left = distances.get(0)
+        results[idx].distance_to_right = distances.get(1)
+
+
 def assign_players_by_position(
     results: list[DetectionResult],
     player_indices: list[int],
